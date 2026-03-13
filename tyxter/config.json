@@ -1,0 +1,86 @@
+{
+  "name": "FutCerto",
+  "version": "2.0.0",
+  "description": "Plataforma de agendamento de quadras via WhatsApp",
+  "webhook": {
+    "url": "https://seu-dominio.com/webhook/tyxter",
+    "method": "POST",
+    "secret_header": "X-Tyxter-Secret"
+  },
+  "flows": [
+    {
+      "id": "onboarding",
+      "trigger": "first_message",
+      "message": "E aí! ⚽ Bem-vindo ao FutCerto!\n\nSou seu assistente para encontrar e reservar quadras.\n\nO que você quer fazer?",
+      "buttons": [
+        { "id": "find_court", "label": "Encontrar quadra" },
+        { "id": "my_bookings", "label": "Minhas reservas" }
+      ]
+    },
+    {
+      "id": "find_court",
+      "trigger": "button:find_court",
+      "forward_to_webhook": true
+    },
+    {
+      "id": "my_bookings",
+      "trigger": "button:my_bookings",
+      "forward_to_webhook": true
+    },
+    {
+      "id": "all_text",
+      "trigger": "text_message",
+      "forward_to_webhook": true
+    }
+  ],
+  "templates": [
+    {
+      "id": "booking_confirmed",
+      "name": "futcerto_booking_confirmed",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "header",
+          "format": "text",
+          "text": "✅ Reserva Confirmada!"
+        },
+        {
+          "type": "body",
+          "text": "Olá {{1}}! Sua reserva foi confirmada:\n\n🏟️ {{2}}\n📅 {{3}} às {{4}}\n💰 R$ {{5}}\n\nAte lá! ⚽"
+        }
+      ]
+    },
+    {
+      "id": "booking_reminder",
+      "name": "futcerto_booking_reminder",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "header",
+          "format": "text",
+          "text": "🔔 Lembrete de Reserva"
+        },
+        {
+          "type": "body",
+          "text": "{{1}}, sua partida é amanhã!\n\n🏟️ {{2}}\n⏰ {{3}}\n📍 {{4}}"
+        }
+      ]
+    },
+    {
+      "id": "new_booking_request",
+      "name": "futcerto_new_booking_request",
+      "language": "pt_BR",
+      "components": [
+        {
+          "type": "header",
+          "format": "text",
+          "text": "🆕 Novo Pedido de Reserva"
+        },
+        {
+          "type": "body",
+          "text": "Gestão FutCerto:\n\nCódigo: *{{1}}*\nJogador: {{2}}\n📅 {{3}} - {{4}} às {{5}}\n💰 R$ {{6}}\n\nAprovar ou recusar pelo WhatsApp."
+        }
+      ]
+    }
+  ]
+}
