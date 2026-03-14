@@ -1,94 +1,209 @@
-import OpenAI from 'openai'
-import { config } from '../config'
-import { tools as gestorTools } from '../tools/gestor-tools'
+// =============================================================================
+// gestor.ts - Gestor Agent
+// FutCerto v2.0
+// Gerencia aprovações, grade e operações para gestores de quadra
+// =============================================================================
 
-const openai = new OpenAI({ apiKey: config.ai.apiKey })
+import OpenAI from "openai";
+import fs from "fs";
+import path from "path";
+import { getConfig } from "../config";
+import { getSupabaseServiceClient } from "../services/supabase";
+import { createModuleLogger } from "../utils/logger";
+import { GESTOR_TOOLS } from "../tools/registry";
+import { getBookings } from "../tools/get-bookings";
+import { approveBooking } from "../tools/approve-booking";
+import { rejectBooking } from "../tools/reject-booking";
+import { getWeeklySchedule } from "../tools/weekly-schedule";
+import { blockTimeslot } from "../tools/block-timeslot";
+import type { IncomingMessage, UserContext, AgentResult } from "../channels/types";
 
-const SYSTEM_PROMPT = `Você é o assistente do FutCerto para GESTORES de quadras esportivas.
+const log = createModuleLogger("agent:gestor");
 
-Suas responsabilidades:
-- Mostrar agenda e reservas da quadra
-- Gerenciar bloqueios de horário
-- Cancelar reservas quando necessário
-- Fornecer relatórios de ocupação e faturamento
-- Responder dúvidas sobre a plataforma
+// Carrega o prompt do arquivo .md
+const SYSTEM_PROMPT = fs.readFileSync(
+  path.join(__dirname, "prompts/gestor.md"),
+  "utf-8"
+);
 
-Regras de conduta:
-- Seja direto e profissional
-- Confirme ações importantes antes de executar
-- Sempre informe o total de reservas ao mostrar a agenda
-- Use formatação simples (sem markdown excessivo) pois é WhatsApp
+// Mapa de execução das tools do gestor
+const TOOL_EXECUTORS: Record<string, (args: Record<string, unknown>) => Promise<unknown>> = {
+  get_user_bookings: (args) => getBookings(args as Parameters<typeof getBookings>[0]),
+  approve_booking: (args) => approveBooking(args as Parameters<typeof approveBooking>[0]),
+  reject_booking: (args) => rejectBooking(args as Parameters<typeof rejectBooking>[0]),
+  get_weekly_schedule: (args) => getWeeklySchedule(args as Parameters<typeof getWeeklySchedule>[0]),
+  block_timeslot: (args) => blockTimeslot(args as Parameters<typeof blockTimeslot>[0]),
+};
 
-Formato de datas: DD/MM/YYYY
-Formato de horas: HH:MM
-Moeda: R$ com 2 casas decimais`
-
-export class GestorAgent {
-  private conversationHistory: OpenAI.Chat.ChatCompletionMessageParam[] = []
-
-  async process(phone: string, message: string): Promise<string> {
-    this.conversationHistory.push({ role: 'user', content: message })
-
-    let response = await openai.chat.completions.create({
-      model: config.ai.model,
-      temperature: config.ai.temperature,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...this.conversationHistory,
-      ],
-      tools: gestorTools,
-      tool_choice: 'auto',
-    })
-
-    // Agentic loop
-    while (response.choices[0].finish_reason === 'tool_calls') {
-      const toolCalls = response.choices[0].message.tool_calls!
-      this.conversationHistory.push(response.choices[0].message)
-
-      const toolResults = await Promise.all(
-        toolCalls.map(async (tc) => {
-          const result = await executeTool(tc.function.name, JSON.parse(tc.function.arguments))
-          return {
-            role: 'tool' as const,
-            tool_call_id: tc.id,
-            content: JSON.stringify(result),
-          }
-        })
-      )
-
-      this.conversationHistory.push(...toolResults)
-
-      response = await openai.chat.completions.create({
-        model: config.ai.model,
-        temperature: config.ai.temperature,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          ...this.conversationHistory,
-        ],
-        tools: gestorTools,
-        tool_choice: 'auto',
-      })
-    }
-
-    const assistantMessage = response.choices[0].message.content || ''
-    this.conversationHistory.push({ role: 'assistant', content: assistantMessage })
-
-    // Mantém apenas as últimas 20 mensagens para não exceder o contexto
-    if (this.conversationHistory.length > 20) {
-      this.conversationHistory = this.conversationHistory.slice(-20)
-    }
-
-    return assistantMessage
-  }
+/**
+ * Busca todas as quadras do gestor
+ */
+async function getManagerCourts(managerId: string) {
+  const supabase = getSupabaseServiceClient();
+  const { data } = await supabase
+    .from("courts")
+    .select("id, name")
+    .eq("manager_id", managerId)
+    .eq("is_active", true);
+  return data ?? [];
 }
 
-async function executeTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-  const { listarReservasGestor, gerenciarBloqueios, cancelarReservaGestor } = await import('../tools/gestor-tools-impl')
+/**
+ * Busca resumo de pendências para mostrar ao gestor no início
+ */
+async function getPendingSummary(managerId: string): Promise<string> {
+  const supabase = getSupabaseServiceClient();
+  const courts = await getManagerCourts(managerId);
 
-  switch (name) {
-    case 'listarReservasGestor': return listarReservasGestor(args)
-    case 'gerenciarBloqueios': return gerenciarBloqueios(args)
-    case 'cancelarReservaGestor': return cancelarReservaGestor(args)
-    default: throw new Error(`Tool desconhecida: ${name}`)
+  if (courts.length === 0) {
+    return "Nenhuma quadra cadastrada ainda.";
   }
+
+  const courtIds = courts.map(c => c.id);
+
+  const { data: pending } = await supabase
+    .from("bookings")
+    .select("id, court_id")
+    .in("court_id", courtIds)
+    .eq("status", "pending");
+
+  const pendingCount = pending?.length ?? 0;
+
+  return courts.map(c => {
+    const courtPending = pending?.filter(p => p.court_id === c.id).length ?? 0;
+    return `🏟️ *${c.name}*: ${courtPending} pedido(s) pendente(s)`;
+  }).join("\n") + (pendingCount > 0 ? `\n\n⚠️ Total: ${pendingCount} reserva(s) aguardando aprovação` : "");
+}
+
+/**
+ * Processa mensagem do gestor com loop de tool calling
+ */
+export async function handleGestorMessage(
+  message: IncomingMessage,
+  context: UserContext
+): Promise<AgentResult> {
+  const config = getConfig();
+  const supabase = getSupabaseServiceClient();
+  const openai = new OpenAI({ apiKey: config.openai.apiKey });
+
+  // Busca quadras do gestor
+  const courts = await getManagerCourts(context.userId!);
+  const courtIds = courts.map(c => c.id);
+  const pendingSummary = await getPendingSummary(context.userId!);
+
+  // Busca histórico de conversa
+  const { data: history } = await supabase
+    .from("conversation_history")
+    .select("message, sender")
+    .eq("user_id", context.userId!)
+    .eq("agent_type", "gestor")
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  const userMessageText = message.type === "text" ? (message.text ?? "") : `[${message.type}]`;
+
+  const conversationHistory: OpenAI.ChatCompletionMessageParam[] = (history ?? [])
+    .reverse()
+    .map(h => ({
+      role: (h.sender === "user" ? "user" : "assistant") as "user" | "assistant",
+      content: h.message,
+    }));
+
+  // Contexto do gestor
+  const gestorContext = `
+Gestor atual:
+- Nome: ${context.name}
+- ID: ${context.userId}
+- Quadras: ${courts.map(c => `${c.name} (ID: ${c.id})`).join(", ")}
+- IDs das quadras: ${courtIds.join(", ")}
+
+Resumo de pendências:
+${pendingSummary}
+
+IMPORTANTE: Use manager_id = "${context.userId}" em todas as chamadas de tools que precisarem de autenticação.
+`;
+
+  const messages: OpenAI.ChatCompletionMessageParam[] = [
+    { role: "system", content: `${SYSTEM_PROMPT}\n\n${gestorContext}` },
+    ...conversationHistory,
+    { role: "user", content: userMessageText },
+  ];
+
+  const toolsCalled: string[] = [];
+  let intent: string | undefined;
+
+  // Loop de tool calling
+  for (let iteration = 0; iteration < 5; iteration++) {
+    const response = await openai.chat.completions.create({
+      model: config.openai.model,
+      temperature: 0.3, // Gestor: mais determinístico
+      messages,
+      tools: GESTOR_TOOLS,
+      tool_choice: "auto",
+    });
+
+    const choice = response.choices[0];
+    const assistantMessage = choice.message;
+
+    if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+      const responseText = assistantMessage.content ?? "Não entendi. Digite 'ajuda' para ver as opções.";
+
+      await saveHistory(supabase, context.userId!, userMessageText, responseText, intent);
+
+      return { response: responseText, intent, toolsCalled };
+    }
+
+    messages.push(assistantMessage);
+
+    for (const toolCall of assistantMessage.tool_calls) {
+      const toolName = toolCall.function.name;
+      toolsCalled.push(toolName);
+      if (!intent) intent = toolName;
+
+      log.info({ toolName, managerId: context.userId }, "Tool chamada pelo Gestor Agent");
+
+      let toolResult: unknown;
+      try {
+        const args = JSON.parse(toolCall.function.arguments);
+
+        // Injeta manager_id e court_id(s) automaticamente
+        if (["approve_booking", "reject_booking", "block_timeslot"].includes(toolName)) {
+          args.manager_id = context.userId;
+        }
+        // Se tool precisar de court_id e não foi informado, usa a primeira quadra
+        if (toolName === "get_weekly_schedule" && !args.court_id && courtIds.length > 0) {
+          args.court_id = courtIds[0];
+        }
+
+        const executor = TOOL_EXECUTORS[toolName];
+        toolResult = executor ? await executor(args) : { error: `Tool '${toolName}' não implementada` };
+      } catch (error) {
+        toolResult = { error: String(error) };
+      }
+
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: JSON.stringify(toolResult),
+      });
+    }
+  }
+
+  return {
+    response: "Desculpe, tive um problema. Tente novamente. 🙏",
+    toolsCalled,
+  };
+}
+
+async function saveHistory(
+  supabase: ReturnType<typeof getSupabaseServiceClient>,
+  userId: string,
+  userMessage: string,
+  botResponse: string,
+  intent?: string
+) {
+  await supabase.from("conversation_history").insert([
+    { user_id: userId, message: userMessage, sender: "user" as const, agent_type: "gestor" as const, intent: intent ?? null },
+    { user_id: userId, message: botResponse, sender: "bot" as const, agent_type: "gestor" as const, intent: intent ?? null },
+  ]).catch(() => {});
 }

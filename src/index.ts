@@ -1,77 +1,118 @@
-import express from 'express'
-import { config } from './config'
-import { MessageRouter } from './agents/router'
+// =============================================================================
+// index.ts - Ponto de entrada principal do FutCerto v2.0
+// =============================================================================
 
-const app = express()
-app.use(express.json())
+import express from "express";
+import { getConfig } from "./config";
+import { logger } from "./utils/logger";
+import { handleMessage } from "./agents/router";
+import { EvolutionApiAdapter } from "./channels/evolution-api";
+import { OpenClawAdapter } from "./channels/openclaw";
+import type { IncomingMessage, UserContext } from "./channels/types";
 
-const router = new MessageRouter()
+const config = getConfig();
+const app = express();
+
+// Middleware básico
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 // Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.0.0', timestamp: new Date().toISOString() })
-})
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "futcerto-whatsapp",
+    version: "2.0.0",
+    timestamp: new Date().toISOString(),
+    environment: config.app.nodeEnv,
+  });
+});
 
-// Webhook Evolution API
-app.post('/webhook/evolution', async (req, res) => {
+// Inicializa adaptadores de canal
+const evolutionAdapter = new EvolutionApiAdapter();
+const openclawAdapter = new OpenClawAdapter();
+
+/**
+ * Handler principal de mensagens — processa e responde
+ */
+async function processMessage(message: IncomingMessage): Promise<void> {
+  const context: UserContext = {
+    phoneNumber: message.from,
+    contactName: message.contactName,
+    role: "unknown",
+  };
+
   try {
-    const { data } = req.body
-    if (!data?.message) return res.sendStatus(200)
+    logger.info({
+      from: message.from.replace(/(\d{4})\d+(\d{4})/, "$1****$2"),
+      type: message.type,
+    }, "Mensagem recebida");
 
-    await router.route({
-      channel: 'evolution',
-      phone: data.key.remoteJid.replace('@s.whatsapp.net', ''),
-      message: data.message.conversation || data.message.extendedTextMessage?.text || '',
-      raw: req.body,
-    })
+    const result = await handleMessage(message, context);
 
-    res.sendStatus(200)
+    if (result.response) {
+      await evolutionAdapter.sendMessage({
+        to: message.from,
+        text: result.response,
+        delay: 1200,
+      });
+    }
   } catch (error) {
-    console.error('Evolution webhook error:', error)
-    res.sendStatus(500)
-  }
-})
+    logger.error({ error, from: message.from }, "Erro ao processar mensagem");
 
-// Webhook OpenClaw
-app.post('/webhook/openclaw', async (req, res) => {
+    // Envia mensagem de erro amigável ao usuário
+    try {
+      await evolutionAdapter.sendMessage({
+        to: message.from,
+        text: "Desculpe, tive um problema técnico. Tente novamente em instantes. 🙏",
+      });
+    } catch {}
+  }
+}
+
+// Registra handlers de mensagem
+evolutionAdapter.onMessage(processMessage);
+openclawAdapter.onMessage(processMessage);
+
+// Registra rotas dos canais
+evolutionAdapter.registerWebhookRoute(app);
+openclawAdapter.registerRoutes(app);
+
+// Inicia servidor
+async function start() {
   try {
-    const { from, text } = req.body
-    if (!text) return res.sendStatus(200)
+    logger.info("Iniciando FutCerto v2.0...");
 
-    await router.route({
-      channel: 'openclaw',
-      phone: from,
-      message: text,
-      raw: req.body,
-    })
+    // Inicializa Evolution API (cria instância se necessário)
+    await evolutionAdapter.initialize();
 
-    res.sendStatus(200)
+    app.listen(config.app.port, () => {
+      logger.info({
+        port: config.app.port,
+        env: config.app.nodeEnv,
+      }, `FutCerto v2.0 rodando na porta ${config.app.port}`);
+
+      logger.info("Endpoints disponíveis:");
+      logger.info(`  GET  /health`);
+      logger.info(`  POST /webhook/messages (Evolution API)`);
+      logger.info(`  POST /openclaw/skill (OpenClaw)`);
+      logger.info(`  POST /openclaw/message (OpenClaw)`);
+    });
   } catch (error) {
-    console.error('OpenClaw webhook error:', error)
-    res.sendStatus(500)
+    logger.fatal({ error }, "Falha ao iniciar o servidor");
+    process.exit(1);
   }
-})
+}
 
-// Webhook Tyxter
-app.post('/webhook/tyxter', async (req, res) => {
-  try {
-    const { contact, message } = req.body
-    if (!message?.text) return res.sendStatus(200)
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  logger.info("SIGTERM recebido — encerrando servidor...");
+  process.exit(0);
+});
 
-    await router.route({
-      channel: 'tyxter',
-      phone: contact.phone,
-      message: message.text,
-      raw: req.body,
-    })
+process.on("SIGINT", () => {
+  logger.info("SIGINT recebido — encerrando servidor...");
+  process.exit(0);
+});
 
-    res.sendStatus(200)
-  } catch (error) {
-    console.error('Tyxter webhook error:', error)
-    res.sendStatus(500)
-  }
-})
-
-app.listen(config.app.port, () => {
-  console.log(`FutCerto v2.0 rodando na porta ${config.app.port}`)
-})
+start();
