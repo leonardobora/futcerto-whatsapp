@@ -49,6 +49,8 @@ export interface UserContext {
   phoneNumber: string;
   userId?: string;           // UUID do usuário no banco
   name?: string;
+  /** Nome do contato no WhatsApp */
+  contactName?: string;
   role?: "jogador" | "gestor" | "unknown";
   currentAgent?: "router" | "jogador" | "gestor";
   /** Dados temporários da sessão (quadra selecionada, data escolhida, etc.) */
