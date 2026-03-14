@@ -1,39 +1,67 @@
-import { createClient } from '@supabase/supabase-js'
-import { config } from '../config'
+// =============================================================================
+// registry.ts - Registro de todas as tools no formato OpenAI function calling
+// FutCerto v2.0
+// =============================================================================
 
-const supabase = createClient(config.supabase.url, config.supabase.serviceKey)
+import { searchCourtsSchema } from "./search-courts";
+import { createBookingSchema } from "./create-booking";
+import { getBookingsSchema } from "./get-bookings";
+import { cancelBookingSchema } from "./cancel-booking";
+import { approveBookingSchema } from "./approve-booking";
+import { rejectBookingSchema } from "./reject-booking";
+import { getWeeklyScheduleSchema } from "./weekly-schedule";
+import { blockTimeslotSchema } from "./block-timeslot";
 
-export const getPendingBookingsTool = {
-  type: 'function' as const,
-  function: {
-    name: 'get_pending_bookings',
-    description: 'Lista reservas pendentes de aprovação para as quadras do gestor',
-    parameters: {
-      type: 'object',
-      properties: {
-        gestor_phone: {
-          type: 'string',
-          description: 'Telefone do gestor',
-        },
-      },
-      required: ['gestor_phone'],
+// Formato OpenAI ChatCompletionTool
+function toOpenAITool(schema: {
+  name: string;
+  description: string;
+  parameters: object;
+}) {
+  return {
+    type: "function" as const,
+    function: {
+      name: schema.name,
+      description: schema.description,
+      parameters: schema.parameters,
     },
-  },
+  };
 }
 
-export async function getPendingBookings(args: { gestor_phone: string }): Promise<object[]> {
-  const { gestor_phone } = args
+// Tools disponíveis para o Jogador Agent
+export const JOGADOR_TOOLS = [
+  toOpenAITool(searchCourtsSchema),
+  toOpenAITool(createBookingSchema),
+  toOpenAITool(getBookingsSchema),
+  toOpenAITool(cancelBookingSchema),
+];
 
-  const { data } = await supabase
-    .from('bookings')
-    .select(`
-      booking_code, date, start_time, end_time, total_price, created_at,
-      court:courts!inner(name, owner:users!courts_owner_id_fkey!inner(phone)),
-      player:users!bookings_player_id_fkey(name, phone)
-    `)
-    .eq('status', 'pending')
-    .eq('court.owner.phone', gestor_phone)
-    .order('created_at', { ascending: true })
+// Tools disponíveis para o Gestor Agent
+export const GESTOR_TOOLS = [
+  toOpenAITool(getBookingsSchema),   // Para listar pendentes
+  toOpenAITool(approveBookingSchema),
+  toOpenAITool(rejectBookingSchema),
+  toOpenAITool(getWeeklyScheduleSchema),
+  toOpenAITool(blockTimeslotSchema),
+];
 
-  return data || []
-}
+// Todas as tools (para referência)
+export const ALL_TOOLS = [
+  ...JOGADOR_TOOLS,
+  toOpenAITool(approveBookingSchema),
+  toOpenAITool(rejectBookingSchema),
+  toOpenAITool(getWeeklyScheduleSchema),
+  toOpenAITool(blockTimeslotSchema),
+];
+
+// Mapa de função pelo nome para execução dinâmica
+export const TOOL_FUNCTION_MAP: Record<string, string> = {
+  search_courts: "searchCourts",
+  create_booking: "createBooking",
+  get_user_bookings: "getBookings",
+  cancel_booking: "cancelBooking",
+  approve_booking: "approveBooking",
+  reject_booking: "rejectBooking",
+  get_weekly_schedule: "getWeeklySchedule",
+  block_timeslot: "blockTimeslot",
+};
